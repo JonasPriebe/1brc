@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.IO.MemoryMappedFiles;
 using System.Text;
 
@@ -5,6 +6,7 @@ namespace _1brc.IO;
 
 public class IO
 {
+    [SuppressMessage("ReSharper.DPA", "DPA0000: DPA issues")]
     public static void ReadContents(FileInfo file)
     {
         if (file == null)
@@ -25,16 +27,23 @@ public class IO
             var bytesToRead = (int)Math.Min(buffer.Length, fileLength - i);
             accessor.ReadArray(i, buffer, 0, bytesToRead);
             var chunk = leftover + Encoding.UTF8.GetString(buffer, 0, bytesToRead);
-            var lines= chunk.Split("\n");
-            for (var j = 0; j < lines.Length - 1; j++)
+            using (var reader = new StringReader(chunk))
             {
-                lineCounter++;
-                Console.WriteLine("line: " + lineCounter +", Content: " + lines[j] );
+                string prevLine = null;
+                string? line;
+                while ((line = reader.ReadLine())!= null)
+                {
+                    prevLine = line;
+                    lineCounter++;
+                }
+
+                if (chunk.EndsWith("\n") || prevLine == null) continue;
+                leftover = prevLine;
+                lineCounter--;
             }
-            leftover = lines[^1];
         }
         if(string.IsNullOrEmpty(leftover) == false)
-            Console.WriteLine("line: " + ++lineCounter +", Content: " + leftover );
+            Console.WriteLine("line: " + lineCounter  );
     }
     
 }
