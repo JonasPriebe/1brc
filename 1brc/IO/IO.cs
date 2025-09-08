@@ -21,11 +21,9 @@ public class IO
         if (file.Exists == false)
             throw new FileNotFoundException("Couldn't find input file at: " + file.FullName);
 
-        using var mmf = MemoryMappedFile.CreateFromFile(file.FullName, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        
+        var bytes = File.ReadAllBytes(file.FullName);
+        var memoryBytes = new Memory<byte>(bytes);
         var maxThreads = Environment.ProcessorCount;
-        Console.WriteLine("System has '" + maxThreads + " usable Processors.");
-        
         var fileLength = file.Length;
         var parts = fileLength / maxThreads;
         var threads = new Thread[maxThreads];
@@ -38,25 +36,34 @@ public class IO
             var start = parts * idx;
             var length = idx == maxThreads - 1 ? fileLength - start : parts;
             
-            var accessor = mmf.CreateViewAccessor(start, length, MemoryMappedFileAccess.Read);
-            
             threads[t] = new Thread(() =>
             {
-                var threadRes = EntryParse(length, accessor, threadDicts[idx] = new Dictionary<string, Accumulator>());
+                var threadRes = SliceParse();
                 threadCounts[idx] = threadRes;
             });
             threads[t].Start();
             Console.WriteLine("Thread started with idx: " + idx);
         }
 
-        for (var index = 0; index < threads.Length; index++)
-        {
-            threads[index].Join();
-            Console.WriteLine("Thread " + index + " has read '" + threadCounts[index] + "' lines.");
-        }
+        foreach (var t in threads)
+            t.Join();
 
         var total = threadCounts.Sum();
         var globalDict = new Dictionary<string, Accumulator>();
+        JoinDicts(threadDicts, globalDict);
+        
+        Console.WriteLine("total lines read after Join: " + total);
+        
+        foreach (var kvp in globalDict.OrderBy(x => x.Key))
+            Console.WriteLine(kvp.Key+";"+ kvp.Value.min + ";" + kvp.Value.mean + ";" + kvp.Value.max);
+    }
+    
+    static int SliceParse()
+    {
+    }
+
+    private static void JoinDicts(Dictionary<string, Accumulator>[] threadDicts, Dictionary<string, Accumulator> globalDict)
+    {
         foreach (var dict in threadDicts)
         {
             foreach (var entry in dict)
@@ -82,64 +89,8 @@ public class IO
                 }
             }
         }
-        Console.WriteLine("total lines read after Join: " + total);
-        foreach (var kvp in globalDict.OrderBy(x => x.Key))
-        {
-            Console.WriteLine(kvp.Key+";"+ kvp.Value.min + ";" + kvp.Value.mean + ";" + kvp.Value.max);
-        }
     }
 
-    static int EntryParse(long accessorLength, MemoryMappedViewAccessor accessor, Dictionary<string,Accumulator> threadDict)
-    {
-        var chunkSize = 64000;
-        var byteBuffer = new byte[chunkSize + 4];
-        var charBuffer = new char[chunkSize];
-        var leftoverLength = 0;
-        int leftoverChars = 0;
-        var lineCounter = 0;
-        var decoder = Encoding.UTF8.GetDecoder();
-        for (long offset = 0; offset < accessorLength; offset += chunkSize)
-        {
-            var bytesToRead = (int)Math.Min(chunkSize, accessorLength - offset);
-            accessor.ReadArray(offset, byteBuffer, leftoverLength, bytesToRead);
-
-            var totalBytes = leftoverLength + bytesToRead;
-            ReadOnlySpan<byte> spanToDecode = byteBuffer.AsSpan(0, totalBytes);
-
-            decoder.Convert(byteBuffer, 0, totalBytes, charBuffer, leftoverChars, charBuffer.Length - leftoverChars, false,
-                out var bytesUsed, out var charsUsed, out var completed);
-
-            leftoverLength = totalBytes - bytesUsed;
-            if (leftoverLength > 0)
-                Buffer.BlockCopy(byteBuffer, bytesUsed, byteBuffer, 0, leftoverLength);
-
-            var lineStart = 0;
-            for (var i = 0; i < leftoverChars + charsUsed; i++)
-            {
-                if (charBuffer[i] != '\n') continue;
-                // TODO: Add Processing, min, max, mean
-                ReadOnlySpan<char> lineSpan = charBuffer.AsSpan(lineStart, i - lineStart).Trim();
-                if(lineSpan.IsEmpty == false)
-                    ProcessLine(lineSpan, threadDict);
-                lineCounter++;
-                lineStart = i + 1;
-            }
-
-            leftoverChars = leftoverChars + charsUsed - lineStart;
-            if (leftoverChars > 0)
-                Buffer.BlockCopy(charBuffer, lineStart * sizeof(char), charBuffer, 0, leftoverChars * sizeof(char));
-
-        }
-
-        if (leftoverLength <= 0) return lineCounter;
-        // TODO: Add Processing, min, max, mean
-        ReadOnlySpan<char> finalLine = charBuffer.AsSpan(0, leftoverChars);
-        if (finalLine.Contains('\n'))
-            ProcessLine(finalLine, threadDict);
-        lineCounter++;
-
-        return lineCounter;
-    }
 
     static void ProcessLine(ReadOnlySpan<char> line, Dictionary<string, Accumulator> threadDict)
     {
