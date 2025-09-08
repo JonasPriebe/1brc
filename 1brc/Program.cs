@@ -2,4 +2,4 @@
 
 using _1brc.IO;
 
-IO.ReadContents(new FileInfo("/home/bob/projects/1brc.data/measurements-1000000000.txt"));
+IO.ReadContents(new FileInfo("/home/bob/projects/1brc.data/measurements-100000.txt"));
