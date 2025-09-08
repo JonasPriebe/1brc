@@ -42,7 +42,7 @@ ScaffoldingReadMe.txt
 CodeCoverage/
 
 #ide stuff
-.idea/
+*/.idea/
 *.sln.DotSettings.user
 
 # MSBuild Binary and Structured Log
