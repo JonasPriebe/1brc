@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Formats.Tar;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace _1brc.IO;
@@ -10,10 +11,10 @@ public class IO
 {
     class Accumulator
     {
-        public float mean = 0;
-        public float min = float.MaxValue;
-        public float max = float.MinValue;
-        public int count = 0;
+        public float Mean = 0;
+        public float Min = float.MaxValue;
+        public float Max = float.MinValue;
+        public int Count = 0;
     }
 
     public static void ReadContents(FileInfo file)
@@ -75,8 +76,71 @@ public class IO
 
     static int EntryParse(MemoryMappedViewAccessor memory, Dictionary<string, Accumulator> threadDict)
     {
- 
+        var count = 0;
+
+        // Read entire accessor into a single byte array
+        var bytes = new byte[memory.Capacity];
+        memory.ReadArray(0, bytes, 0, (int)memory.Capacity);
+
+        var utf8 = Encoding.UTF8;
+        var decoder = utf8.GetDecoder();
+
+        // Use a smaller char buffer for incremental decoding
+        int blockSize = 4 * 1024 * 1024; // 4 MB blocks
+        var charBuffer = new char[utf8.GetMaxCharCount(blockSize)];
+
+        var carryLine = new List<char>();
+        int byteIndex = 0;
+        var stringBuffer = new StringBuilder(capacity:100);
+        while (byteIndex < bytes.Length)
+        {
+            int bytesToDecode = Math.Min(blockSize, bytes.Length - byteIndex);
+
+            decoder.Convert(
+                bytes, byteIndex, bytesToDecode,
+                charBuffer, 0, charBuffer.Length,
+                flush: false,
+                out int bytesUsed, out int charsUsed, out bool completed
+            );
+
+            // Process characters
+            int lineStart = 0;
+            for (int i = 0; i < charsUsed; i++)
+            {
+                if (charBuffer[i] == '\n')
+                {
+                    if (carryLine.Count > 0)
+                    {
+                        carryLine.AddRange(charBuffer.AsSpan(lineStart, i - lineStart));
+                        ProcessLine(CollectionsMarshal.AsSpan(carryLine), threadDict, stringBuffer);
+                        carryLine.Clear();
+                    }
+                    else
+                    {
+                        ProcessLine(charBuffer.AsSpan(lineStart, i - lineStart), threadDict, stringBuffer);
+                    }
+                    count++;
+                    lineStart = i + 1;
+                }
+            }
+
+            // Save leftover characters that did not end with '\n'
+            if (lineStart < charsUsed)
+                carryLine.AddRange(charBuffer.AsSpan(lineStart, charsUsed - lineStart));
+
+            byteIndex += bytesUsed;
+        }
+
+        // Process any remaining characters
+        if (carryLine.Count > 0)
+        {
+            ProcessLine(carryLine.ToArray(), threadDict, stringBuffer);
+            count++;
+        }
+
+        return count;
     }
+
 
     // With naive block partitioning of the original memory <T> i ran into the issue of the blocks not ending on \n
     // this could be managed with overlapping memory<T> splits, but the more elegant approach is to end the blocks 
@@ -90,18 +154,18 @@ public class IO
 
         while (start < total)
         {
-            long end = Math.Min(start + chunkSize, total);
-            int scanSize = (int)Math.Min(1000, total - end);
+            var end = Math.Min(start + chunkSize, total);
+            var scanSize = (int)Math.Min(1000, total - end);
 
-            byte[] buffer = new byte[scanSize];
+            var buffer = new byte[scanSize];
             if (scanSize > 0)
             {
                 using var accessor = memory.CreateViewAccessor(end, scanSize, MemoryMappedFileAccess.Read);
                 accessor.ReadArray(0, buffer, 0, scanSize);
             }
-            
-            int index = Array.IndexOf(buffer, (byte)'\n');
-            int size = (index != -1) ? (int)(end - start + index + 1) : (int)(end - start + scanSize);
+
+            var index = Array.IndexOf(buffer, (byte)'\n');
+            var size = index != -1 ? (int)(end - start + index + 1) : (int)(end - start + scanSize);
 
             var completeView = memory.CreateViewAccessor(start, size, MemoryMappedFileAccess.Read);
             chunks.Add(completeView);
@@ -113,44 +177,40 @@ public class IO
     }
 
 
-    static void PrintSummary(int[] threadCounts, Dictionary<string, Accumulator>[] threadDicts)
+    private static void PrintSummary(int[] threadCounts, Dictionary<string, Accumulator>[] threadDicts)
     {
         var total = threadCounts.Sum();
         var globalDict = new Dictionary<string, Accumulator>();
         foreach (var dict in threadDicts)
+        foreach (var entry in dict)
         {
-            foreach (var entry in dict)
+            var key = entry.Key;
+            var acc = entry.Value;
+            if (globalDict.TryGetValue(key, out var globalAcc) == false)
             {
-                var key = entry.Key;
-                var acc = entry.Value;
-                if (globalDict.TryGetValue(key, out var globalAcc) == false)
+                globalDict[key] = new Accumulator()
                 {
-                    globalDict[key] = new Accumulator()
-                    {
-                        min = acc.min,
-                        max = acc.max,
-                        mean = acc.mean,
-                        count = acc.count,
-                    };
-                }
-                else
-                {
-                    globalAcc.min = Math.Min(acc.min, globalAcc.min);
-                    globalAcc.max = Math.Max(acc.max, globalAcc.max);
-                    globalAcc.count += acc.count;
-                    globalAcc.mean = (globalAcc.mean * globalAcc.count + acc.mean + acc.count) / globalAcc.count;
-                }
+                    Min = acc.Min,
+                    Max = acc.Max,
+                    Mean = acc.Mean,
+                    Count = acc.Count
+                };
+            }
+            else
+            {
+                globalAcc.Min = Math.Min(acc.Min, globalAcc.Min);
+                globalAcc.Max = Math.Max(acc.Max, globalAcc.Max);
+                globalAcc.Count += acc.Count;
+                globalAcc.Mean = (globalAcc.Mean * globalAcc.Count + acc.Mean + acc.Count) / globalAcc.Count;
             }
         }
 
         Console.WriteLine("total lines read after Join: " + total);
         foreach (var kvp in globalDict.OrderBy(x => x.Key))
-        {
-            Console.WriteLine(kvp.Key + ";" + kvp.Value.min + ";" + kvp.Value.mean + ";" + kvp.Value.max);
-        }
+            Console.WriteLine(kvp.Key + ";" + kvp.Value.Min + ";" + kvp.Value.Mean + ";" + kvp.Value.Max);
     }
 
-    static void ProcessLine(ReadOnlySpan<char> line, Dictionary<string, Accumulator> threadDict)
+    private static void ProcessLine(ReadOnlySpan<char> line, Dictionary<string, Accumulator> threadDict, StringBuilder stringBuffer)
     {
         var seperatorIndex = line.IndexOf(';');
         if (seperatorIndex == -1)
@@ -162,27 +222,29 @@ public class IO
         var keySpan = line.Slice(0, seperatorIndex);
         var valueSpan = line.Slice(seperatorIndex + 1);
 
-        var key = string.Intern(keySpan.ToString());
+        stringBuffer.Clear();
+        stringBuffer.Insert(0,keySpan);
+        //stringBuffer = new string(keySpan);
 
         if (float.TryParse(valueSpan, out var value) == false)
         {
             Console.WriteLine("Unable to parse: '" + valueSpan.ToString() + "' into a valid float!");
             return;
         }
-        CalculateValues(key, value, threadDict);
+        CalculateValues(stringBuffer, value, threadDict);
     }
 
-    static void CalculateValues(string key, float value, Dictionary<string, Accumulator> threadDict)
+    static void CalculateValues(StringBuilder key, float value, Dictionary<string, Accumulator> threadDict)
     {
-        if (threadDict.TryGetValue(key, out var inputValues) == false)
+        if (threadDict.TryGetValue(key.ToString(), out var inputValues) == false)
         {
-            threadDict[key] = new Accumulator() { min = value, max = value, mean = value, count = 1 };
+            threadDict[key.ToString()] = new Accumulator() { Min = value, Max = value, Mean = value, Count = 1 };
             return;
         }
 
-        inputValues.min = Math.Min(value, inputValues.min);
-        inputValues.max = Math.Max(value, inputValues.max);
+        inputValues.Min = Math.Min(value, inputValues.Min);
+        inputValues.Max = Math.Max(value, inputValues.Max);
         // https://constreference.wordpress.com/2019/11/29/incremental-means-and-variances/
-        inputValues.mean += (value - inputValues.mean) / ++inputValues.count;
+        inputValues.Mean += (value - inputValues.Mean) / ++inputValues.Count;
     }
 }
