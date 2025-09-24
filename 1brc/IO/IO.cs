@@ -9,12 +9,16 @@ namespace _1brc.IO;
 
 public class IO
 {
-    class Accumulator
+    private struct Accumulator
     {
         public float Mean = 0;
         public float Min = float.MaxValue;
         public float Max = float.MinValue;
         public int Count = 0;
+
+        public Accumulator()
+        {
+        }
     }
 
     public static void ReadContents(FileInfo file)
@@ -34,10 +38,10 @@ public class IO
         var workers = new Thread[maxThreads];
         
         var threadCounts = new int[maxThreads];
-        var threadDicts = new Dictionary<string, Accumulator>[maxThreads];
+        var threadDicts = new Dictionary<char[], Accumulator>[maxThreads];
         for (int i = 0; i < threadDicts.Length; i++)
         {
-            threadDicts[i] = new Dictionary<string, Accumulator>();
+            threadDicts[i] = new Dictionary<char[], Accumulator>();
         }
         var stack = new ConcurrentQueue<MemoryMappedViewAccessor>();
         
@@ -52,7 +56,7 @@ public class IO
             workers[idx] = new Thread(() =>
             {
                 while (stack.TryDequeue(out var memoryPart))
-                {   threadDicts[idx] ??= new Dictionary<string, Accumulator>();
+                {   threadDicts[idx] ??= new Dictionary<char[], Accumulator>();
                     threadCounts[idx] += EntryParse(memoryPart, threadDicts[idx]);
                 }
             });
@@ -74,7 +78,7 @@ public class IO
         
     }
 
-    static int EntryParse(MemoryMappedViewAccessor memory, Dictionary<string, Accumulator> threadDict)
+    static int EntryParse(MemoryMappedViewAccessor memory, Dictionary<char[], Accumulator> threadDict)
     {
         var count = 0;
 
@@ -86,38 +90,37 @@ public class IO
         var decoder = utf8.GetDecoder();
 
         // Use a smaller char buffer for incremental decoding
-        int blockSize = 4 * 1024 * 1024; // 4 MB blocks
+        var blockSize = 512000;
         var charBuffer = new char[utf8.GetMaxCharCount(blockSize)];
-
+        var threadBuffer = new char[utf8.GetMaxCharCount(blockSize)];
         var carryLine = new List<char>();
-        int byteIndex = 0;
-        var stringBuffer = new StringBuilder(capacity:100);
+        var byteIndex = 0;
         while (byteIndex < bytes.Length)
         {
-            int bytesToDecode = Math.Min(blockSize, bytes.Length - byteIndex);
+            var bytesToDecode = Math.Min(blockSize, bytes.Length - byteIndex);
 
             decoder.Convert(
                 bytes, byteIndex, bytesToDecode,
                 charBuffer, 0, charBuffer.Length,
                 flush: false,
-                out int bytesUsed, out int charsUsed, out bool completed
+                out var bytesUsed, out var charsUsed, out var completed
             );
 
             // Process characters
-            int lineStart = 0;
-            for (int i = 0; i < charsUsed; i++)
+            var lineStart = 0;
+            for (var i = 0; i < charsUsed; i++)
             {
                 if (charBuffer[i] == '\n')
                 {
                     if (carryLine.Count > 0)
                     {
                         carryLine.AddRange(charBuffer.AsSpan(lineStart, i - lineStart));
-                        ProcessLine(CollectionsMarshal.AsSpan(carryLine), threadDict, stringBuffer);
+                        ProcessLine(CollectionsMarshal.AsSpan(carryLine), threadDict,threadBuffer);
                         carryLine.Clear();
                     }
                     else
                     {
-                        ProcessLine(charBuffer.AsSpan(lineStart, i - lineStart), threadDict, stringBuffer);
+                        ProcessLine(charBuffer.AsSpan(lineStart, i - lineStart), threadDict,threadBuffer);
                     }
                     count++;
                     lineStart = i + 1;
@@ -134,12 +137,13 @@ public class IO
         // Process any remaining characters
         if (carryLine.Count > 0)
         {
-            ProcessLine(carryLine.ToArray(), threadDict, stringBuffer);
+            ProcessLine(carryLine.ToArray(), threadDict,threadBuffer);
             count++;
         }
 
         return count;
     }
+
 
 
     // With naive block partitioning of the original memory <T> i ran into the issue of the blocks not ending on \n
@@ -176,19 +180,17 @@ public class IO
         return chunks.ToArray();
     }
 
-
-    private static void PrintSummary(int[] threadCounts, Dictionary<string, Accumulator>[] threadDicts)
+    private static void PrintSummary(int[] threadCounts, Dictionary<char[], Accumulator>[] threadDicts)
     {
         var total = threadCounts.Sum();
-        var globalDict = new Dictionary<string, Accumulator>();
+        var globalDict = new Dictionary<char[], Accumulator>();
         foreach (var dict in threadDicts)
         foreach (var entry in dict)
         {
-            var key = entry.Key;
             var acc = entry.Value;
-            if (globalDict.TryGetValue(key, out var globalAcc) == false)
+            if (globalDict.TryGetValue(entry.Key, out var globalAcc) == false)
             {
-                globalDict[key] = new Accumulator()
+                globalDict[entry.Key] = new Accumulator()
                 {
                     Min = acc.Min,
                     Max = acc.Max,
@@ -206,11 +208,13 @@ public class IO
         }
 
         Console.WriteLine("total lines read after Join: " + total);
-        foreach (var kvp in globalDict.OrderBy(x => x.Key))
+        Dictionary<string,Accumulator> finalDict = new Dictionary<string, Accumulator>();
+
+        foreach (var kvp in globalDict.OrderBy(x => x.Key.ToString()))
             Console.WriteLine(kvp.Key + ";" + kvp.Value.Min + ";" + kvp.Value.Mean + ";" + kvp.Value.Max);
     }
 
-    private static void ProcessLine(ReadOnlySpan<char> line, Dictionary<string, Accumulator> threadDict, StringBuilder stringBuffer)
+    private static void ProcessLine(ReadOnlySpan<char> line, Dictionary<char[], Accumulator> threadDict, char[] intermediateBuffer)
     {
         var seperatorIndex = line.IndexOf(';');
         if (seperatorIndex == -1)
@@ -222,23 +226,20 @@ public class IO
         var keySpan = line.Slice(0, seperatorIndex);
         var valueSpan = line.Slice(seperatorIndex + 1);
 
-        stringBuffer.Clear();
-        stringBuffer.Insert(0,keySpan);
-        //stringBuffer = new string(keySpan);
-
         if (float.TryParse(valueSpan, out var value) == false)
         {
             Console.WriteLine("Unable to parse: '" + valueSpan.ToString() + "' into a valid float!");
             return;
         }
-        CalculateValues(stringBuffer, value, threadDict);
+        CalculateValues(keySpan, value, threadDict, intermediateBuffer);
     }
 
-    static void CalculateValues(StringBuilder key, float value, Dictionary<string, Accumulator> threadDict)
+    static void CalculateValues(ReadOnlySpan<char> key, float value, Dictionary<char[], Accumulator> threadDict, char[] intermediateBuffer)
     {
-        if (threadDict.TryGetValue(key.ToString(), out var inputValues) == false)
+        key.CopyTo(intermediateBuffer);
+        if (threadDict.TryGetValue(intermediateBuffer, out var inputValues) == false)
         {
-            threadDict[key.ToString()] = new Accumulator() { Min = value, Max = value, Mean = value, Count = 1 };
+            threadDict[intermediateBuffer] = new Accumulator() { Min = value, Max = value, Mean = value, Count = 1 };
             return;
         }
 
