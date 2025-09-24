@@ -210,8 +210,8 @@ public class IO
         Console.WriteLine("total lines read after Join: " + total);
         Dictionary<string,Accumulator> finalDict = new Dictionary<string, Accumulator>();
 
-        foreach (var kvp in globalDict.OrderBy(x => x.Key.ToString()))
-            Console.WriteLine(kvp.Key + ";" + kvp.Value.Min + ";" + kvp.Value.Mean + ";" + kvp.Value.Max);
+        foreach (var kvp in globalDict.OrderBy(x => new string(x.Key)))
+            Console.WriteLine(new string(kvp.Key) + ";" + kvp.Value.Min + ";" + kvp.Value.Mean + ";" + kvp.Value.Max);
     }
 
     private static void ProcessLine(ReadOnlySpan<char> line, Dictionary<char[], Accumulator> threadDict, char[] intermediateBuffer)
